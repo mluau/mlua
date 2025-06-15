@@ -401,6 +401,9 @@ pub(crate) unsafe fn compare_refs<R>(
 }
 
 pub(crate) unsafe fn get_next_spot(extra: *mut ExtraData) -> (usize, c_int, bool) {
+    if extra.is_null() {
+        panic!("get_next_spot called with null extra pointer");
+    }
     let extra = &mut *extra;
 
     // Find the first thread with a free slot

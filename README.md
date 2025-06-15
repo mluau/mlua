@@ -34,6 +34,9 @@ This repository is a fork of `mlua` with a greater focus on Luau, with the follo
   - Removal of the `__gc` metamethod on userdata; although implemented by mlua, [should not be supported in Luau](https://luau.org/sandbox#__gc) due to memory safety and optimization considerations.
   - ``collectgarbage`` now limited to options ``"count"`` and ``"collect"`` for better sandboxing. Importantly, this disallows user code from purposely stopping the garbage collector, even when sandbox mode is disabled.
 - Removal of ``Lua::scope``, a feature we don't use that carried a slight performance penalty.
+- Integration with the [Lute](https://github.com/luau-lang/lute) runtime
+- Support for getting metatable of non-mlua/non-Rust userdata via the unsafe ``AnyUserData::underlying_metatable`` method. This is useful for managing ``newproxy`` and (Luau only) Lute userdata.
+- ``Thread::pop_results`` unsafe function has been added to allow popping results directly from the thread's stack to a ``R`` which implements ``FromLua``. This is useful when trying to interoperate with Lute runtime
 
 ## Roadmap
 
@@ -42,9 +45,6 @@ This repository is a fork of `mlua` with a greater focus on Luau, with the follo
   - Support for Luau AST, Compiler, etc. reflection through Lute.
 - Tagged userdata (performance optimization)
 - Removing Lua 5.1 -> 5.4 support to ease maintenance burden and allow us to focus solely on Luau.
-
-<!-- # The main branch is the development version of `mluau`. Please see the [v0.10](https://github.com/mluau/mluau/tree/v0.10) branch for the stable versions of `mlua`.
- -->
 
 ## The below is `mlua`'s last README which should still be accurate or mostly accurate to `mluau`
 

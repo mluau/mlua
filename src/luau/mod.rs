@@ -39,6 +39,32 @@ impl Lua {
 
         Ok(())
     }
+
+    #[cfg(feature = "luau-lute")]
+    pub(crate) unsafe fn configure_luau_lute(&self) -> Result<()> {
+        let globals = self.globals();
+
+        println!("Globals: {globals:?}");
+
+        globals.raw_set("collectgarbage", self.create_c_function(lua_collectgarbage)?)?;
+        globals.raw_set("loadstring", self.create_c_function(lua_loadstring)?)?;
+
+        println!("raw_set done");
+
+        // Set `_VERSION` global to include version number
+        // The environment variable `LUAU_VERSION` set by the build script
+        if let Some(version) = ffi::luau_version() {
+            globals.raw_set("_VERSION", format!("Luau {version}"))?;
+        }
+
+        // Enable default `require` implementation
+        let require = self.create_require_function(require::TextRequirer::new())?;
+        self.globals().raw_set("require", require)?;
+
+        println!("Luau Lute configured successfully");
+
+        Ok(())
+    }
 }
 
 unsafe extern "C-unwind" fn lua_collectgarbage(state: *mut ffi::lua_State) -> c_int {
@@ -101,3 +127,6 @@ unsafe extern "C-unwind" fn lua_loadstring(state: *mut ffi::lua_State) -> c_int 
 }
 
 mod require;
+
+#[cfg(feature = "luau-lute")]
+pub mod lute;

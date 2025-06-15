@@ -831,6 +831,44 @@ impl AnyUserData {
         self.raw_metatable().map(UserDataMetatable)
     }
 
+    /// Returns the raw metatable of this [`AnyUserData`].
+    /// without any additional checks.
+    ///
+    /// This is mainly useful with lute and luau-created userdata
+    /// which do not have a type id from mlua.
+    ///
+    /// Returns ``UserDataTypeMismatch`` if the userdata is empty or has no metatable.
+    ///
+    /// Safety:
+    ///
+    /// It is up to the user to ensure that changes made to the underlying metatable
+    /// do not modify restricted mlua userdata metamethods etc. When in doubt, use
+    /// ``metatable()`` instead. It is possible to cause memory unsafety by abusing
+    /// ``underlying_metatable()```, for example by modifying/calling the `__gc` metamethod
+    pub unsafe fn underlying_metatable(&self) -> Result<Table> {
+        self.raw_underlying_metatable()
+    }
+
+    fn raw_underlying_metatable(&self) -> Result<Table> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 1)?;
+
+            // Push the userdata onto the stack
+            // Note that we cannot use `lua.push_userdata_ref_at` here
+            // as that requires a type id to be present.
+            lua.push_ref_at(&self.0, state);
+
+            let res = ffi::lua_getmetatable(state, -1); // Checked that non-empty on the previous call
+            if res == 0 {
+                return Err(Error::UserDataTypeMismatch);
+            }
+            Ok(Table(lua.pop_ref()))
+        }
+    }
+
     fn raw_metatable(&self) -> Result<Table> {
         let lua = self.0.lua.lock();
         let state = lua.state();

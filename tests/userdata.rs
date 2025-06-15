@@ -665,6 +665,16 @@ fn test_metatable() -> Result<()> {
     let metatable = ud.metatable()?;
     assert_eq!(metatable.get::<String>(MetaMethod::Type)?.to_str()?, "CustomName");
 
+    unsafe {
+        let underlying_metatable = ud.underlying_metatable()?;
+        assert_eq!(
+            underlying_metatable
+                .get::<String>(MetaMethod::Type.to_string())?
+                .to_str()?,
+            "CustomName"
+        );
+    }
+
     Ok(())
 }
 

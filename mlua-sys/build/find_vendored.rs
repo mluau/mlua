@@ -18,12 +18,41 @@ pub fn probe_lua() {
         .lua52compat(cfg!(feature = "luajit52"))
         .build();
 
-    #[cfg(feature = "luau")]
-    let artifacts = luau0_src::Build::new()
-        .enable_codegen(cfg!(feature = "luau-codegen"))
-        .set_max_cstack_size(1000000)
-        .set_vector_size(if cfg!(feature = "luau-vector4") { 4 } else { 3 })
-        .build();
+    #[cfg(feature = "luau-lute")]
+    {
+        #[cfg(not(feature = "luau"))]
+        {
+            compile_error!("lute runtime requires luau feature to be enabled");
+        }
 
-    artifacts.print_cargo_metadata();
+        #[cfg(feature = "luau-vector4")]
+        {
+            compile_error!("lute runtime does not support vector4 builds");
+        }
+        let lcfg = lute_src_rs::LConfig {
+            disable_crypto: if cfg!(feature = "luau-lute-crypto") {
+                false
+            } else {
+                true
+            },
+            disable_net: if cfg!(feature = "luau-lute-net") {
+                false
+            } else {
+                true
+            },
+            ..Default::default()
+        };
+        lute_src_rs::build_lute(lcfg);
+    }
+    #[cfg(not(feature = "luau-lute"))]
+    {
+        #[cfg(feature = "luau")]
+        let artifacts = luau0_src::Build::new()
+            .enable_codegen(cfg!(feature = "luau-codegen"))
+            .set_max_cstack_size(1000000)
+            .set_vector_size(if cfg!(feature = "luau-vector4") { 4 } else { 3 })
+            .build();
+
+        artifacts.print_cargo_metadata();
+    }
 }

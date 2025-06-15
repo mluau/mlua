@@ -50,6 +50,65 @@ use crate::{
     types::{HookCallback, HookKind, VmState},
 };
 
+#[cfg(feature = "luau-lute")]
+use crate::luau::lute::{LuteRuntimeHandle, LuteStdLib, LuteSchedulerRunOnceResult};
+
+#[cfg(feature = "luau-lute")]
+use std::{sync::LazyLock, panic::{catch_unwind, AssertUnwindSafe}};
+
+#[cfg(feature = "luau-lute")]
+static SETUP_LUTE_RUNTIME_INITTER: LazyLock<()> = LazyLock::new(|| {
+    unsafe {
+        pub unsafe extern "C" fn init_config(config: *mut ffi::lutec_setupState) {
+            unsafe extern "C-unwind" fn setup_lua_state(wrapper: *mut ffi::lua_State_wrapper) {
+                let parent = (*wrapper).parent;
+                if parent.is_null() {
+                    panic!("Parent Lua state is null");
+                }
+
+                callback_error_ext(
+                    parent,
+                    std::ptr::null_mut(),
+                    false,
+                    move |extra, _| {
+                        let parent_lua = (*extra).lua();
+
+                        // We cannot drop this state, it is owned by the Lute runtime
+                        let mut rawlua = RawLua::new_ext(StdLib::ALL_SAFE, &LuaOptions::default(), true);
+                        (*rawlua.lock().extra.get()).no_drop = true;
+
+                        let lua = Lua {
+                            raw: rawlua,
+                            collect_garbage: true,
+                        };
+                
+                        mlua_expect!(lua.configure_luau(), "Error configuring Luau"); 
+
+
+                        if let Some(lute_runtimeinitter) = &(*extra).lute_runtimeinitter {
+                            lute_runtimeinitter(parent_lua, &lua)?;
+                        }
+
+                        // Lute expects the Lua state to be sandboxed
+                        lua.sandbox(true)?;       
+
+                        (*wrapper).L = lua.lock().main_state();
+
+                        Ok(())
+                    }
+                )
+            }
+    
+            (*config).setup_lua_state = setup_lua_state;
+        }
+    
+        let res = ffi::lutec_set_runtimeinitter(init_config);
+        if res != 0 {
+            panic!("internal error: runtimeinitter failed")
+        }
+    }
+});
+
 /// An inner Lua struct which holds a raw Lua state.
 #[doc(hidden)]
 pub struct RawLua {
@@ -65,6 +124,29 @@ impl Drop for RawLua {
         unsafe {
             if !self.owned {
                 return;
+            }
+
+            #[cfg(feature = "luau-lute")]
+            {
+                let extra = self.extra.get();
+                if (*extra).no_drop {
+                    // If no_drop is set, we do not drop the Lute runtime
+                    //
+                    // SAFETY: Needed by runtime_initter to not drop the runtime
+                    return;
+                }
+            }
+
+            println!("Dropping Lua state: {:?}", self.main_state());
+
+            #[cfg(feature = "luau-lute")]
+            {
+                // SAFETY: lutec_isruntimeloaded and lutec_destroy_runtime
+                // do not need any extra stack space and should not
+                // throw an exception
+                if ffi::lutec_isruntimeloaded(self.main_state()) == 1 {
+                    ffi::lutec_destroy_runtime(self.main_state());
+                }
             }
 
             let mem_state = MemoryState::get(self.main_state());
@@ -98,6 +180,254 @@ impl RawLua {
     #[inline(always)]
     pub(crate) fn weak(&self) -> &WeakLua {
         unsafe { (*self.extra.get()).weak() }
+    }
+
+    #[cfg(feature = "luau-lute")]
+    /// Returns if a lute runtime is loaded into the client or not
+    pub(crate) fn is_lute_loaded(&self) -> Result<bool> {
+        let mut is_loaded = false;
+        unsafe {
+            let state = self.main_state();
+            check_stack(state, 1)?;
+            protect_lua!(state, 0, 0, |state| {
+                if ffi::lutec_isruntimeloaded(state) == 1 {
+                    is_loaded = true
+                }
+            })?;
+
+            if is_loaded && (*self.extra.get()).lute_handle.is_none() {
+                (*self.extra.get()).lute_handle = Some(LuteRuntimeHandle::new(self)?);
+            }
+        };
+
+        Ok(is_loaded)
+    }
+
+    #[cfg(feature = "luau-lute")]
+    pub(crate) fn setup_lute_runtime(&self) -> Result<()> {
+        unsafe {
+            let state = self.main_state();
+            protect_lua!(state, 0, 0, |state| {
+                ffi::lutec_setup_runtime(state);
+            })?;
+
+            (*self.extra.get()).lute_handle = Some(LuteRuntimeHandle::new(self)?);
+        };
+
+        Ok(())
+    }
+
+    #[cfg(feature = "luau-lute")]
+    unsafe fn get_pushed_lute_table(&self) -> Table {
+        let state = self.main_state();
+        let (aux_thread, idxs, replace) = get_next_spot(self.extra.get());
+        ffi::lua_xmove(state, self.ref_thread(aux_thread), 1);
+        if replace {
+            ffi::lua_replace(self.ref_thread(aux_thread), idxs);
+        }
+        Table(self.new_value_ref(aux_thread, idxs))
+    }
+
+    /// Loads the specified lute standard libraries into the current Lua state.
+    ///
+    /// This errors if the runtime is not loaded.
+    #[cfg(feature = "luau-lute")]
+    pub(crate) fn load_lute_stdlib(&self, libs: LuteStdLib) -> Result<()> {
+        if !self.is_lute_loaded()? {
+            return Err(Error::external(
+                "Lute runtime is not loaded. Please call setup_lute_runtime first.",
+            ));
+        }
+
+        unsafe {
+            let extra = self.extra.get();
+
+            // SAFETY: is_lute_loaded() ensures that lute_handle is Some()
+            // and no one should be calling load_lute_stdlib while holding a
+            // mutable reference to the lute handle.
+            let mut handle = (*extra).lute_handle.as_mut().unwrap_unchecked();
+
+            let state = self.main_state();
+            let _sg = StackGuard::new(state);
+            check_stack(state, 1)?;
+            protect_lua!(state, 0, 0, |state| {
+                #[cfg(feature = "luau-lute-crypto")]
+                if libs.contains(LuteStdLib::CRYPTO) && handle.crypto.is_none() {
+                    ffi::lutec_opencrypto(state);
+                    handle.crypto = Some(self.get_pushed_lute_table());
+                }
+
+                if libs.contains(LuteStdLib::FS) && handle.fs.is_none() {
+                    ffi::lutec_openfs(state);
+                    handle.fs = Some(self.get_pushed_lute_table());
+                }
+                if libs.contains(LuteStdLib::LUAU) && handle.luau.is_none() {
+                    ffi::lutec_openluau(state);
+                    handle.luau = Some(self.get_pushed_lute_table());
+                }
+                #[cfg(feature = "luau-lute-net")]
+                if libs.contains(LuteStdLib::NET) && handle.net.is_none() {
+                    ffi::lutec_opennet(state);
+                    handle.net = Some(self.get_pushed_lute_table());
+                }
+                if libs.contains(LuteStdLib::PROCESS) && handle.process.is_none() {
+                    ffi::lutec_openprocess(state);
+                    handle.process = Some(self.get_pushed_lute_table());
+                }
+                if libs.contains(LuteStdLib::TASK) && handle.task.is_none() {
+                    ffi::lutec_opentask(state);
+                    handle.task = Some(self.get_pushed_lute_table());
+                }
+                if libs.contains(LuteStdLib::VM) && handle.vm.is_none() {
+                    ffi::lutec_openvm(state);
+                    handle.vm = Some(self.get_pushed_lute_table());
+                }
+                if libs.contains(LuteStdLib::SYSTEM) && handle.system.is_none() {
+                    ffi::lutec_opensystem(state);
+                    handle.system = Some(self.get_pushed_lute_table());
+                }
+                if libs.contains(LuteStdLib::TIME) && handle.time.is_none() {
+                    ffi::lutec_opentime(state);
+                    handle.time = Some(self.get_pushed_lute_table());
+                }
+            })?;
+        };
+
+        Ok(())
+    }
+
+    #[cfg(feature = "luau-lute")]
+    pub(crate) fn lute_handle(&self) -> Option<LuteRuntimeHandle> {
+        // SAFETY: lute_handle is cloned so a double-mutable reference should
+        // not be possible
+        unsafe { (*self.extra.get()).lute_handle.clone() } 
+    }
+
+    #[cfg(feature = "luau-lute")]
+    pub(crate) fn destroy_lute_runtime(&self) -> Result<bool> {
+        let mut has_destroyed = false;
+        unsafe {
+            let state = self.main_state();
+            protect_lua!(state, 0, 0, |state| {
+                has_destroyed = ffi::lutec_destroy_runtime(state) == 0;
+            })?;
+        };
+
+        if has_destroyed {
+            // Clear the lute handle
+            unsafe { (*self.extra.get()).lute_handle = None };
+        }
+
+        Ok(has_destroyed)
+    }
+
+    #[cfg(all(feature = "luau-lute", feature = "send"))]
+    pub(crate) fn set_lute_runtime_initter<F>(&self, f: F)
+    where
+        F: Fn(&Lua, &Lua) -> Result<()> + Send + Sync + 'static,
+    {
+        unsafe {
+            let extra = self.extra.get();
+            (*extra).lute_runtimeinitter = Some(Box::new(f));
+        }
+    }
+
+    #[cfg(all(feature = "luau-lute", not(feature = "send")))]
+    pub(crate) fn set_lute_runtime_initter<F>(&self, f: F)
+    where
+        F: Fn(&Lua, &Lua) -> Result<()> + 'static,
+    {
+        unsafe {
+            let extra = self.extra.get();
+            (*extra).lute_runtimeinitter = Some(Box::new(f));
+        }
+    }
+
+    /// Returns if the Lute scheduler has any work to do.
+    #[cfg(feature = "luau-lute")]
+    pub(crate) fn has_lute_work(&self) -> Result<bool> {
+        let state = self.main_state();
+        let has_work = unsafe { ffi::lutec_has_work(state) != 0 };
+        Ok(has_work)
+    }
+
+    /// Returns if the Lute scheduler has any threads to run.
+    #[cfg(feature = "luau-lute")]
+    pub(crate) fn has_lute_threads(&self) -> Result<bool> {
+        let state = self.main_state();
+        let has_threads = unsafe { ffi::lutec_has_threads(state) != 0 };
+        Ok(has_threads)
+    }
+
+    /// Returns if the Lute scheduler has any continuations to run.
+    #[cfg(feature = "luau-lute")]
+    pub(crate) fn has_lute_continuations(&self) -> Result<bool> {
+        let state = self.main_state();
+        let has_continuations = unsafe { ffi::lutec_has_continuation(state) != 0 };
+        Ok(has_continuations)
+    }
+
+    #[cfg(feature = "luau-lute")]
+    /// Returns a Function that runs the Lute scheduler once.
+    pub(crate) fn lute_run_once_lua(&self) -> Result<Function> {
+        unsafe {
+            let (aux_thread, idx, replace) = get_next_spot(self.extra());
+            ffi::lua_pushcfunction(self.ref_thread(aux_thread), ffi::lutec_run_once_lua);
+            if replace {
+                ffi::lua_replace(self.ref_thread(aux_thread), idx);
+            }
+
+            Ok(Function(self.new_value_ref(aux_thread, idx)))
+        }
+    }
+
+    #[cfg(feature = "luau-lute")]
+    /// Runs one iteration of the Lute scheduler.
+    pub(crate) fn lute_run_once(&self) -> Result<LuteSchedulerRunOnceResult> {
+        let state = self.main_state();
+
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 1)?;
+            let res = ffi::lutec_run_once(state);
+
+            match res.op {
+                ffi::LUTE_STATE_MISSING_ERROR => {
+                    return Err(Error::external("Lute runtime is not loaded"));
+                }
+                ffi::LUTE_STATE_ERROR => {
+                    // Pop the error
+                    check_stack(res.state, 2)?;
+                    let err = pop_error(res.state, ffi::LUA_ERRRUN);
+                    return Err(err);
+                }
+                ffi::LUTE_STATE_SUCCESS => {
+                    let main_state = ffi::lua_mainthread(res.state);
+                    let extra = ExtraData::get(main_state);
+                    let rawlua = (*extra).raw_lua();
+
+                    //res.state is now a nice thread
+                    check_stack(res.state, 1)?;
+                    let (aux_thread, idxs, replace) = get_next_spot(extra);
+                    ffi::lua_pushthread(res.state);
+                    ffi::lua_xmove(res.state, rawlua.ref_thread(aux_thread), 1);
+                    let thread_state = ffi::lua_tothread(rawlua.ref_thread(aux_thread), -1);
+                    if replace {
+                        ffi::lua_replace(rawlua.ref_thread(aux_thread), idxs);
+                    }
+                    let th = Thread(self.new_value_ref(aux_thread, idxs), thread_state);       
+
+                    return Ok(LuteSchedulerRunOnceResult::Success(th));
+                }
+                ffi::LUTE_STATE_EMPTY => {
+                    return Ok(LuteSchedulerRunOnceResult::Empty);
+                }
+                ffi::LUTE_STATE_UNSUPPORTED_OP => {
+                    return Err(Error::external("Unsupported Lute operation"));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     /// Returns a pointer to the current Lua state.
@@ -137,6 +467,16 @@ impl RawLua {
     }
 
     pub(super) unsafe fn new(libs: StdLib, options: &LuaOptions) -> XRc<ReentrantMutex<Self>> {
+        #[cfg(feature = "luau-lute")]
+        {
+            // Ensure that the lute runtime is initialized
+            let _ = *SETUP_LUTE_RUNTIME_INITTER;
+        }
+
+        Self::new_ext(libs, options, true)
+    }
+
+    pub(super) unsafe fn new_ext(libs: StdLib, options: &LuaOptions, owned: bool) -> XRc<ReentrantMutex<Self>> {
         let mem_state: *mut MemoryState = Box::into_raw(Box::default());
         let mut state = ffi::lua_newstate(ALLOCATOR, mem_state as *mut c_void);
         // If state is null then switch to Lua internal allocator
@@ -155,7 +495,7 @@ impl RawLua {
             ffi::luau_codegen_create(state);
         }
 
-        let rawlua = Self::init_from_ptr(state, true);
+        let rawlua = Self::init_from_ptr(state, owned);
         let extra = rawlua.lock().extra.get();
 
         mlua_expect!(

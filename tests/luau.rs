@@ -462,3 +462,7 @@ fn test_typeof_error() -> Result<()> {
 
 #[path = "luau/require.rs"]
 mod require;
+
+#[cfg(feature = "luau-lute")]
+#[path = "lute/lute.rs"]
+mod lute;

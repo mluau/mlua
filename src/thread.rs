@@ -76,6 +76,17 @@ impl Thread {
         self.1
     }
 
+    /// Tries converting whatevers on the thread stack to ``R``.
+    pub unsafe fn pop_results<R>(&self) -> Result<R>
+    where
+        R: FromLuaMulti,
+    {
+        let lua = self.0.lua.lock();
+        let thread_state = self.state();
+        let nresults = ffi::lua_gettop(thread_state);
+        R::from_specified_stack_multi(nresults, &lua, thread_state)
+    }
+
     /// Resumes execution of this thread.
     ///
     /// Equivalent to [`coroutine.resume`].

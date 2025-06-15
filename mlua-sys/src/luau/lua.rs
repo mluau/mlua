@@ -12,9 +12,15 @@ pub const LUA_MULTRET: c_int = -1;
 const LUAI_MAXCSTACK: c_int = 1000000;
 
 // Number of valid Lua userdata tags
+#[cfg(feature = "luau-lute")]
+pub const LUA_UTAG_LIMIT: c_int = 255;
+#[cfg(not(feature = "luau-lute"))]
 pub const LUA_UTAG_LIMIT: c_int = 128;
 
 // Number of valid Lua lightuserdata tags
+#[cfg(feature = "luau-lute")]
+pub const LUA_LUTAG_LIMIT: c_int = 255;
+#[cfg(not(feature = "luau-lute"))]
 pub const LUA_LUTAG_LIMIT: c_int = 128;
 
 //
